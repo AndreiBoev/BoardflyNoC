@@ -1,21 +1,31 @@
 #!/usr/bin/env python3
-"""Boardfly 4×8×36: граф → anynet → BookSim."""
+"""Boardfly 4×8×32: граф → anynet → BookSim.
+
+Портовый бюджет платы по Google Cloud (TPU 8i deep dive):
+  12 внешних ICI = 8 copper (intra-group) + 4 OCS.
+Активный pod: 32 группы = 1024 чипа (как «up to 1,024 active chips»).
+K32 требует 31 оптический линк на группу; 8 плат × 4 OCS = 32 порта —
+хватает с запасом 1. Укладка: плата q%8, чип q//8 → не больше одного
+оптического порта на чип и не больше 4 на плату.
+"""
 
 from __future__ import annotations
 
 import re
 import subprocess
-import sys
-from collections import deque
+from collections import Counter, deque
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 BOOKSIM = ROOT / "booksim2" / "src" / "booksim"
 OUT = ROOT / "experiments"
 
-BB, GROUP_BBS, GROUPS = 4, 8, 36
-N = BB * GROUP_BBS * GROUPS  # 1152
+BB, GROUP_BBS, GROUPS = 4, 8, 32
+N = BB * GROUP_BBS * GROUPS  # 1024
 INJECTION_RATE = 0.02
+
+COPPER_PORTS_PER_BOARD = 8
+OCS_PORTS_PER_BOARD = 4
 
 CFG = """\
 topology = anynet;
@@ -58,6 +68,12 @@ def chip(group: int, bb: int, c: int) -> int:
     return (group * GROUP_BBS + bb) * BB + c
 
 
+def decode(node: int) -> tuple[int, int, int]:
+    c = node % BB
+    t = node // BB
+    return t // GROUP_BBS, t % GROUP_BBS, c
+
+
 def boardfly_edges() -> set[tuple[int, int]]:
     edges: set[tuple[int, int]] = set()
 
@@ -67,20 +83,70 @@ def boardfly_edges() -> set[tuple[int, int]]:
         edges.add((a, b) if a < b else (b, a))
 
     for g in range(GROUPS):
+        # BB: K4 на плате
         for bb in range(GROUP_BBS):
             for a in range(BB):
                 for b in range(a + 1, BB):
                     link(chip(g, bb, a), chip(g, bb, b))
+
+        # Group: K8 по меди — одно ребро на пару плат (7 портов/плату)
         for i in range(GROUP_BBS):
             for j in range(i + 1, GROUP_BBS):
                 link(chip(g, i, j % BB), chip(g, j, i % BB))
+
+        # 8-й copper-порт: perfect matching параллельных линков на других чипах
+        for i in range(0, GROUP_BBS, 2):
+            j = i + 1
+            ci = (j % BB + 1) % BB
+            cj = (i % BB + 1) % BB
+            link(chip(g, i, ci), chip(g, j, cj))
+
+    # Pod: K32 через OCS. Эндпоинт в группе g к пиру q:
+    # плата q%8, чип q//8 — ровно один оптический порт на чип, ≤4 на плату.
     for p in range(GROUPS):
         for q in range(p + 1, GROUPS):
             link(
-                chip(p, q % GROUP_BBS, (q // GROUP_BBS) % BB),
-                chip(q, p % GROUP_BBS, (p // GROUP_BBS) % BB),
+                chip(p, q % GROUP_BBS, q // GROUP_BBS),
+                chip(q, p % GROUP_BBS, p // GROUP_BBS),
             )
+
     return edges
+
+
+def port_budget(edges: set[tuple[int, int]]) -> dict:
+    """Проверка бюджета: 8 copper + ≤4 OCS на плату, ≤1 OCS на чип."""
+    copper = Counter()
+    optical_board = Counter()
+    optical_chip = Counter()
+    for u, v in edges:
+        gu, bu, cu = decode(u)
+        gv, bv, cv = decode(v)
+        if gu == gv and bu == bv:
+            continue
+        if gu == gv:
+            copper[(gu, bu)] += 1
+            copper[(gv, bv)] += 1
+        else:
+            optical_board[(gu, bu)] += 1
+            optical_board[(gv, bv)] += 1
+            optical_chip[u] += 1
+            optical_chip[v] += 1
+
+    boards = [(g, b) for g in range(GROUPS) for b in range(GROUP_BBS)]
+    cu = [copper[b] for b in boards]
+    opt = [optical_board[b] for b in boards]
+    chip_opt = [optical_chip[i] for i in range(N)]
+    return {
+        "copper_min": min(cu),
+        "copper_max": max(cu),
+        "optical_min": min(opt),
+        "optical_max": max(opt),
+        "optical_mean": sum(opt) / len(opt),
+        "chip_optical_max": max(chip_opt),
+        "group_optical": [
+            sum(optical_board[(g, b)] for b in range(GROUP_BBS)) for g in range(GROUPS)
+        ],
+    }
 
 
 def metrics(n: int, edges: set[tuple[int, int]]) -> dict:
@@ -154,14 +220,44 @@ def main() -> None:
 
     graph = boardfly_edges()
     m = metrics(N, graph)
+    ports = port_budget(graph)
     print(
         f"n={m['n']} deg={m['min_degree']}-{m['max_degree']} "
         f"mean={m['mean_degree']:.3f} diam={m['diameter']} "
         f"asp={m['asp']:.3f} links={m['links']}",
         flush=True,
     )
-    if m["diameter"] != 7 or m["max_degree"] != 7 or abs(m["mean_degree"] - 5.84) > 0.02:
-        raise SystemExit("инварианты Boardfly не сошлись (ожидались diam=7, maxdeg=7, mean≈5.84)")
+    print(
+        f"ports copper={ports['copper_min']}-{ports['copper_max']} "
+        f"ocs={ports['optical_min']}-{ports['optical_max']} "
+        f"(mean {ports['optical_mean']:.3f}) chip_ocs≤{ports['chip_optical_max']}",
+        flush=True,
+    )
+
+    if (
+        m["n"] != 1024
+        or m["diameter"] != 7
+        or m["links"] != 3056
+        or abs(m["mean_degree"] - 5.969) > 0.02
+    ):
+        raise SystemExit(
+            "инварианты Boardfly не сошлись "
+            "(ожидались n=1024, diam=7, links=3056, mean≈5.969)"
+        )
+    if ports["copper_min"] != COPPER_PORTS_PER_BOARD or ports["copper_max"] != COPPER_PORTS_PER_BOARD:
+        raise SystemExit(
+            f"copper-бюджет платы: ожидалось {COPPER_PORTS_PER_BOARD}, "
+            f"получено {ports['copper_min']}-{ports['copper_max']}"
+        )
+    if ports["optical_max"] > OCS_PORTS_PER_BOARD or ports["optical_min"] < OCS_PORTS_PER_BOARD - 1:
+        raise SystemExit(
+            f"OCS-бюджет платы: ожидалось {OCS_PORTS_PER_BOARD - 1}..{OCS_PORTS_PER_BOARD}, "
+            f"получено {ports['optical_min']}-{ports['optical_max']}"
+        )
+    if ports["chip_optical_max"] > 1:
+        raise SystemExit("на чипе должен быть не больше одного оптического порта")
+    if any(n != GROUPS - 1 for n in ports["group_optical"]):
+        raise SystemExit("у группы должно быть ровно |G|-1 оптических линков (K32)")
 
     OUT.mkdir(parents=True, exist_ok=True)
     anynet = OUT / "boardfly.anynet"
